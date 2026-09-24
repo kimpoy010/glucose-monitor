@@ -127,12 +127,19 @@ bias voltage as the electrode ages.
   best, not an absolute number, without extensive per-session calibration
   against a real glucometer.
 
+## Enclosure
+
+A parametric, 3D-printable two-part case (base + OLED-window lid) is in
+[`enclosure/`](enclosure/) -- see `enclosure/README.md` for print/assembly
+instructions and the dimension assumptions to verify against your parts.
+
 ## Repo layout
 
 ```
 platformio.ini        - build config, OLED library deps
 include/Calibration.h - two-point linear calibration struct
 src/main.cpp           - sampling loop, ADC oversampling, OLED display, pin config
+enclosure/             - 3D-printable case (OpenSCAD source + STL exports)
 ```
 
 ## Upgrade path
