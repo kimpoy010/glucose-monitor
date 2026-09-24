@@ -35,6 +35,8 @@ and passive-component kit.
 
 ## Circuit (per channel)
 
+![Wiring diagram](docs/wiring_diagram.png)
+
 This is a 2-electrode cell — no active bias control loop like the
 LMP91000/AD5940 provide, just a fixed bias voltage. Less stable and more
 drift-prone than a real 3-electrode potentiostat, but it's what disposable
