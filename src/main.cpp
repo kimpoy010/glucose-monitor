@@ -1,8 +1,21 @@
-// ESP32-C3 dual-channel electrochemical glucose biosensor reader.
+// ESP32-C3 dual-channel electrochemical glucose biosensor reader + OLED display.
+// Bare-bones discrete version: no LMP91000/ADS1115 breakouts.
 //
-// Channel A (sweat): GOx enzyme electrode -> LMP91000 AFE (I2C, addr 0x48)
-// Channel B (urine): GOx enzyme electrode -> ADS1115 16-bit ADC (I2C, addr 0x48/0x49
-//   depending on ADDR pin strap -- change one AFE's address jumper if both are 0x48)
+// Each channel is a 2-electrode amperometric cell (working + reference/counter
+// tied together) feeding a discrete op-amp transimpedance amplifier (TIA):
+//   working electrode -> op-amp inverting input (virtual ground)
+//   feedback resistor Rf between op-amp inverting input and output
+//   op-amp non-inverting input -> bias voltage (e.g. VCC/2 divider)
+//   reference/counter electrodes -> same bias voltage node
+//   op-amp output -> ESP32-C3 ADC pin
+//
+// A 128x64 SSD1306 I2C OLED displays both readings, refreshed each sample.
+//
+// This trades away the LMP91000's active bias control loop and the ADS1115's
+// 16-bit resolution for near-zero extra hardware cost. The native ESP32-C3
+// ADC is noisy and nonlinear, especially at low voltages -- this firmware
+// leans on heavy oversampling to compensate, but expect more drift and less
+// repeatability than the AFE-based version.
 //
 // IMPORTANT: readings are a relative electrochemical signal only until you
 // run your own two-point calibration (see include/Calibration.h). Do not
@@ -10,17 +23,23 @@
 
 #include <Arduino.h>
 #include <Wire.h>
-#include <Adafruit_ADS1X15.h>
-#include "LMP91000.h"
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 #include "Calibration.h"
 
-// ---- Pins (adjust to your wiring) ----
+// ---- Analog channel pins (adjust to your wiring) ----
+static constexpr int PIN_SWEAT_TIA_OUT = 0; // ADC1_CH0
+static constexpr int PIN_URINE_TIA_OUT = 1; // ADC1_CH1
+
+static constexpr int OVERSAMPLE_COUNT = 64; // averaged per reading to fight ADC noise
+
+// ---- OLED (I2C, SDA/SCL) ----
 static constexpr int PIN_SDA = 8;
 static constexpr int PIN_SCL = 9;
-
-// ---- Devices ----
-LMP91000 sweatAFE(0x48);
-Adafruit_ADS1115 urineADC;
+static constexpr uint8_t OLED_ADDR = 0x3C; // common default; some boards are 0x3D
+static constexpr int OLED_WIDTH = 128;
+static constexpr int OLED_HEIGHT = 64;
+Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
 
 // ---- Calibration (fill in from your own measurements) ----
 LinearCal sweatCal;
@@ -29,35 +48,65 @@ LinearCal urineCal;
 static constexpr uint32_t SAMPLE_INTERVAL_MS = 5000;
 uint32_t lastSample = 0;
 
-float readSweatMillivolts() {
-    // LMP91000's VOUT pin must be wired to an ESP32-C3 ADC-capable GPIO.
-    // Native ADC is noisy for small signals but adequate once amplified by the TIA.
-    static constexpr int PIN_SWEAT_VOUT = 0; // ADC1_CH0 on C3
-    uint32_t raw = analogReadMilliVolts(PIN_SWEAT_VOUT);
-    return static_cast<float>(raw);
+float readMillivoltsOversampled(int pin) {
+    uint64_t sum = 0;
+    for (int i = 0; i < OVERSAMPLE_COUNT; i++) {
+        sum += analogReadMilliVolts(pin);
+        delayMicroseconds(200);
+    }
+    return static_cast<float>(sum) / OVERSAMPLE_COUNT;
 }
 
-float readUrineMillivolts() {
-    int16_t raw = urineADC.readADC_SingleEnded(0);
-    return urineADC.computeVolts(raw) * 1000.0f;
+void updateDisplay(float sweatMv, float sweatConc, float urineMv, float urineConc) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+
+    display.setCursor(0, 0);
+    display.println("Glucose Monitor (DIY)");
+    display.drawLine(0, 10, OLED_WIDTH - 1, 10, SSD1306_WHITE);
+
+    display.setCursor(0, 16);
+    display.printf("Sweat: %.0f mV\n", sweatMv);
+    display.setCursor(0, 28);
+    if (isnan(sweatConc)) {
+        display.println("  (uncalibrated)");
+    } else {
+        display.printf("  ~%.0f mg/dL\n", sweatConc);
+    }
+
+    display.setCursor(0, 42);
+    display.printf("Urine: %.0f mV\n", urineMv);
+    display.setCursor(0, 54);
+    if (isnan(urineConc)) {
+        display.println("  (uncalibrated)");
+    } else {
+        display.printf("  ~%.0f mg/dL\n", urineConc);
+    }
+
+    display.display();
 }
 
 void setup() {
     Serial.begin(115200);
     delay(500);
 
+    analogReadResolution(12);
+    analogSetPinAttenuation(PIN_SWEAT_TIA_OUT, ADC_11db); // full ~0-3.3V range
+    analogSetPinAttenuation(PIN_URINE_TIA_OUT, ADC_11db);
+
     Wire.begin(PIN_SDA, PIN_SCL);
-
-    sweatAFE.begin(Wire);
-    // gainSel=4 (~35k TIA gain), internal 2.5V ref, ~20% bias, negative polarity.
-    // Tune per your electrode's expected current range and required bias voltage.
-    sweatAFE.configure(/*gainSel=*/4, /*refSel=*/0, /*biasPercentSel=*/4, /*biasPolarity=*/0);
-    sweatAFE.setMode(LMP91000::MODE_3LEAD_AMP);
-
-    if (!urineADC.begin(0x49)) {
-        Serial.println("ADS1115 (urine channel) not found -- check wiring/address");
+    if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+        Serial.println("SSD1306 OLED not found -- check wiring/address");
+    } else {
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setTextColor(SSD1306_WHITE);
+        display.setCursor(0, 0);
+        display.println("Glucose Monitor");
+        display.println("Warming up...");
+        display.display();
     }
-    urineADC.setGain(GAIN_ONE); // +/-4.096V range; narrow it once you know your signal range
 
     Serial.println("mv_sweat,mg_dl_sweat,mv_urine,mg_dl_urine");
 }
@@ -67,11 +116,12 @@ void loop() {
     if (now - lastSample < SAMPLE_INTERVAL_MS) return;
     lastSample = now;
 
-    float sweatMv = readSweatMillivolts();
-    float urineMv = readUrineMillivolts();
+    float sweatMv = readMillivoltsOversampled(PIN_SWEAT_TIA_OUT);
+    float urineMv = readMillivoltsOversampled(PIN_URINE_TIA_OUT);
 
     float sweatConc = sweatCal.apply(sweatMv);
     float urineConc = urineCal.apply(urineMv);
 
     Serial.printf("%.1f,%.1f,%.1f,%.1f\n", sweatMv, sweatConc, urineMv, urineConc);
+    updateDisplay(sweatMv, sweatConc, urineMv, urineConc);
 }

@@ -7,9 +7,13 @@
 // recording the AFE output voltage. This is per-electrode, per-batch, and
 // drifts over time -- re-calibrate before trusting any reading.
 struct LinearCal {
-    float mvLow = 0.0f;    // AFE output at low-concentration standard
+    // Defaults intentionally left uncalibrated (mvHigh == mvLow) so apply()
+    // returns NaN and the display shows "(uncalibrated)" until you fill
+    // these in from real measurements -- avoids silently showing a
+    // meaningless number.
+    float mvLow = 0.0f;    // sensor output at low-concentration standard
     float concLow = 0.0f;  // known concentration at that standard (mg/dL)
-    float mvHigh = 1000.0f;
+    float mvHigh = 0.0f;
     float concHigh = 200.0f;
 
     float apply(float mv) const {
